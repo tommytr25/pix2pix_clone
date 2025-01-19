@@ -3,13 +3,16 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import torch.nn.functional as F
+from . import custom_unet, custom_unet_2
+# import custom_unet, custom_unet_2
 
 
 ###############################################################################
 # Helper Functions
 ###############################################################################
 
-
+    
 class Identity(nn.Module):
     def forward(self, x):
         return x
@@ -155,6 +158,20 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         net = UnetGenerator(input_nc, output_nc, 7, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_256':
         net = UnetGenerator(input_nc, output_nc, 8, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
+    elif netG == 'unet_custom':
+        net = custom_unet.CustomUnetGenerator()
+    elif netG == 'unet_custom_2':
+        net = custom_unet_2.CustomUnetGenerator2()
+    # elif netG == 'attention_unet':  # Changed from 'attention' to be more specific
+    #     net = AttentionUnetGenerator(
+    #         input_nc=input_nc,
+    #         output_nc=output_nc,
+    #         num_downs=8,  # For 256x256 images
+    #         ngf=ngf,
+    #         norm_layer=norm_layer,
+    #         use_dropout=use_dropout,
+    #         use_attention=True
+    #     )
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -202,6 +219,17 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal'
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % netD)
     return init_net(net, init_type, init_gain, gpu_ids)
+
+def define_R(output_nc, init_type='normal',init_gain=0.02, gpu_ids=[]):
+    """Create a registration network
+       JWW 20240823
+
+    """
+    net = RegistrationNet(output_nc)
+
+    return init_net(net, init_type, init_gain, gpu_ids)
+    
+
 
 
 ##############################################################################
@@ -452,14 +480,16 @@ class UnetGenerator(nn.Module):
         """
         super(UnetGenerator, self).__init__()
         # construct unet structure
-        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True)  # add the innermost layer
+        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, 
+                                             innermost=True)  # add the innermost layer
         for i in range(num_downs - 5):          # add intermediate layers with ngf * 8 filters
             unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout)
         # gradually reduce the number of filters from ngf * 8 to ngf
         unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
         unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
         unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm_layer=norm_layer)  # add the outermost layer
+        self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, 
+                                             outermost=True, norm_layer=norm_layer)  # add the outermost layer
 
     def forward(self, input):
         """Standard forward"""
@@ -614,3 +644,60 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+class RegistrationNet(nn.Module):
+    """ Network that learns affine transformation parameters to register a pair of images
+        (JWW 20240828) """
+    def __init__(self, output_nc):
+        super().__init__()
+
+        # convolutional front-end encoder
+        self.frontEnd = nn.Sequential(
+            nn.Conv2d(2*output_nc, 32, 3, padding='same', padding_mode='reflect'), # 2*output_nc x 256 x 256 -> 32x256x256
+            nn.ReLU(),
+            nn.MaxPool2d(4),    # 32x256x256 -> 32x64x64
+            nn.Conv2d(32, 32, 3, padding='same', padding_mode='reflect'), # 32x64x64 -> 32x64x64
+            nn.ReLU(),
+            nn.MaxPool2d(2),    # 32x64x64 -> 32x32x32
+            nn.Conv2d(32,32,3, padding='same', padding_mode='reflect'), # 32x32x32 -> 32x32x32
+            nn.ReLU(),
+            nn.MaxPool2d(2),    # 32x32x32 -> 32x16x16
+            nn.Conv2d(32,32,3, padding='same', padding_mode='reflect'), # 32x16x16 -> 32x16x16
+            nn.ReLU(),
+            nn.AdaptiveMaxPool2d((4,4)) # 32x16x16 -> 32x4x4
+        )
+
+        # fully-connected back-end to estimate affine transform parameters from conv embedding
+        self.backEnd = nn.Sequential(
+            nn.Linear(32*4*4, 32*4*4//2),
+            nn.ReLU(),
+            nn.Linear(32*4*4//2, 2) # [tx, ty]
+        )
+
+        self.theta = torch.Tensor([[1,0],[0,1]]) # used for building affine grid
+
+    def to(self, device):
+        super().to(device)
+        self.theta = self.theta.to(device)
+
+    def forward(self, moving, reference):
+        z = self.frontEnd( torch.cat((moving,reference), dim=1) )
+        z = z.flatten()
+        parms = self.backEnd(z)
+
+        # set up affine grid and resample
+        # (At first I tried using torchvision affine transformation, but it doesn't 
+        #  preserve gradients. So I ended up using torch.nn.functional.affine_grid() and grid_sample()
+        #  according to the discussion forum thread here 
+        #  https://discuss.pytorch.org/t/differentiable-affine-transforms-with-grid-sample/79305/5 )
+        tcol = parms.unsqueeze(1)
+        #theta = torch.Tensor([[1,0],[0,1]])
+        theta = torch.cat((self.theta, tcol),1)
+        theta = theta.unsqueeze(0)
+        
+        grid = F.affine_grid(theta,reference.size())
+        out = F.grid_sample(moving, grid, mode='bicubic', padding_mode='border')[0]
+        
+        return out.unsqueeze(0)
+
+
